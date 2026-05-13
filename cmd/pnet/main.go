@@ -2,23 +2,26 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
-	"personal-net/pkg/discovery"
 	"personal-net/pkg/identity"
 	"personal-net/pkg/pairing"
 	"personal-net/pkg/transport"
+
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
+const ProtocolID = "/pnet/1.0.0"
+
 type Config struct {
-	TrustedNodes map[string]string `json:"trusted_nodes"` // fingerprint -> public_key_hex
+	TrustedNodes map[string]string `json:"trusted_nodes"` // fingerprint -> peerID
 }
 
 func main() {
@@ -49,50 +52,45 @@ func main() {
 
 	case "start":
 		id, conf := loadIdAndConfig(keyPath, configPath)
-		port := 8000
-
-		// Start mDNS advertising
-		server, err := discovery.Advertise(id.Fingerprint(), port)
+		h, err := transport.CreateHost(id, 8000)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer server.Shutdown()
+		defer h.Close()
 
-		fmt.Printf("Node started. Fingerprint: %s, listening on :%d\n", id.Fingerprint(), port)
+		fmt.Printf("Node started. PeerID: %s\n", h.ID().String())
+		fmt.Printf("Listening on:\n")
+		for _, addr := range h.Addrs() {
+			fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
+		}
 
-		// Discover others
-		go func() {
-			nodeCh, _ := discovery.Discover(context.Background())
-			for node := range nodeCh {
-				if _, ok := conf.TrustedNodes[node.ID]; ok {
-					fmt.Printf("Discovered trusted node: %s at %s:%d\n", node.ID, node.IP, node.Port)
+		h.SetStreamHandler(ProtocolID, func(s network.Stream) {
+			remotePeer := s.Conn().RemotePeer()
+			isTrusted := false
+			for _, trustedID := range conf.TrustedNodes {
+				if trustedID == remotePeer.String() {
+					isTrusted = true
+					break
 				}
 			}
-		}()
 
-		// Listen for incoming secure connections
-		trustedPubs := []ed25519.PublicKey{}
-		for _, pubHex := range conf.TrustedNodes {
-			pubBytes, _ := hex.DecodeString(pubHex)
-			trustedPubs = append(trustedPubs, ed25519.PublicKey(pubBytes))
-		}
-
-		tlsConf, err := transport.GenerateTLSConfig(id.PrivateKey, trustedPubs)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", port), tlsConf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				continue
+			if !isTrusted {
+				fmt.Printf("Unrecognized peer attempted to connect: %s\n", remotePeer)
+				s.Reset()
+				return
 			}
-			go handleConnection(conn)
-		}
+
+			fmt.Printf("Received message from: %s\n", remotePeer)
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(s, buf); err == nil {
+				if string(buf) == "ping" {
+					s.Write([]byte("pong"))
+				}
+			}
+			s.Close()
+		})
+
+		select {}
 
 	case "pair-host":
 		id, conf := loadIdAndConfig(keyPath, configPath)
@@ -103,14 +101,14 @@ func main() {
 		fmt.Printf("Pairing code: %s\n", code)
 		pairing.DisplayQRCode(code)
 
-		pubs, err := pairing.HandlePairing(id, code, 9000)
+		peers, err := pairing.HandlePairing(id, code, 9000)
 		if err != nil {
 			log.Fatal(err)
 		}
-		for _, pub := range pubs {
-			fp := hex.EncodeToString(pub)
-			conf.TrustedNodes[fp] = fp
-			fmt.Printf("Paired with: %s\n", fp)
+		for _, p := range peers {
+			fp := hex.EncodeToString(p.PublicKey)
+			conf.TrustedNodes[fp] = p.PeerID.String()
+			fmt.Printf("Paired with: %s (PeerID: %s)\n", fp, p.PeerID)
 		}
 		saveConfig(configPath, conf)
 
@@ -122,49 +120,59 @@ func main() {
 		}
 		addr := os.Args[2]
 		code := os.Args[3]
-		pub, err := pairing.JoinPairing(id, code, addr)
+		p, err := pairing.JoinPairing(id, code, addr)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fp := hex.EncodeToString(pub)
-		conf.TrustedNodes[fp] = fp
-		fmt.Printf("Successfully paired with: %s\n", fp)
+		fp := hex.EncodeToString(p.PublicKey)
+		conf.TrustedNodes[fp] = p.PeerID.String()
+		fmt.Printf("Successfully paired with: %s (PeerID: %s)\n", fp, p.PeerID)
 		saveConfig(configPath, conf)
 
 	case "list":
 		_, conf := loadIdAndConfig(keyPath, configPath)
 		fmt.Println("Trusted nodes:")
-		for fp := range conf.TrustedNodes {
-			fmt.Println("- ", fp)
+		for fp, pid := range conf.TrustedNodes {
+			fmt.Printf("- %s (PeerID: %s)\n", fp, pid)
 		}
 
 	case "ping":
-		id, conf := loadIdAndConfig(keyPath, configPath)
+		id, _ := loadIdAndConfig(keyPath, configPath)
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: pnet ping <addr>")
+			fmt.Println("Usage: pnet ping <multiaddr>")
 			return
 		}
-		addr := os.Args[2]
+		targetAddr := os.Args[2]
 
-		trustedPubs := []ed25519.PublicKey{}
-		for _, pubHex := range conf.TrustedNodes {
-			pubBytes, _ := hex.DecodeString(pubHex)
-			trustedPubs = append(trustedPubs, ed25519.PublicKey(pubBytes))
+		h, err := transport.CreateHost(id, 0)
+		if err != nil {
+			log.Fatal(err)
 		}
+		defer h.Close()
 
-		tlsConf, err := transport.GenerateTLSConfig(id.PrivateKey, trustedPubs)
+		maddr, err := multiaddr.NewMultiaddr(targetAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		conn, err := tls.Dial("tcp", addr, tlsConf)
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer conn.Close()
 
-		transport.SendMessage(conn, []byte("ping"))
-		resp, _ := transport.ReceiveMessage(conn)
+		if err := h.Connect(context.Background(), *info); err != nil {
+			log.Fatal(err)
+		}
+
+		s, err := h.NewStream(context.Background(), info.ID, ProtocolID)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer s.Close()
+
+		s.Write([]byte("ping"))
+		resp := make([]byte, 4)
+		io.ReadFull(s, resp)
 		fmt.Printf("Received: %s\n", string(resp))
 
 	default:
@@ -193,15 +201,4 @@ func loadIdAndConfig(keyPath, configPath string) (*identity.Identity, *Config) {
 func saveConfig(path string, conf *Config) {
 	data, _ := json.MarshalIndent(conf, "", "  ")
 	os.WriteFile(path, data, 0600)
-}
-
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
-	msg, err := transport.ReceiveMessage(conn)
-	if err != nil {
-		return
-	}
-	if string(msg) == "ping" {
-		transport.SendMessage(conn, []byte("pong"))
-	}
 }

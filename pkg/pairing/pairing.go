@@ -9,8 +9,15 @@ import (
 	"net"
 	"personal-net/pkg/identity"
 
+	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/skip2/go-qrcode"
 )
+
+type PeerInfo struct {
+	PublicKey ed25519.PublicKey
+	PeerID    peer.ID
+}
 
 func GenerateLinkCode() (string, error) {
 	b := make([]byte, 4)
@@ -29,7 +36,7 @@ func DisplayQRCode(data string) {
 	fmt.Println(q.ToSmallString(false))
 }
 
-func HandlePairing(id *identity.Identity, code string, port int) ([]ed25519.PublicKey, error) {
+func HandlePairing(id *identity.Identity, code string, port int) ([]PeerInfo, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, err
@@ -56,15 +63,26 @@ func HandlePairing(id *identity.Identity, code string, port int) ([]ed25519.Publ
 		return nil, err
 	}
 
-	remotePub := make([]byte, ed25519.PublicKeySize)
-	if _, err := io.ReadFull(conn, remotePub); err != nil {
+	remotePubBytes := make([]byte, ed25519.PublicKeySize)
+	if _, err := io.ReadFull(conn, remotePubBytes); err != nil {
+		return nil, err
+	}
+	remotePub := ed25519.PublicKey(remotePubBytes)
+
+	// Derive PeerID
+	libp2pPub, err := libp2pcrypto.UnmarshalEd25519PublicKey(remotePub)
+	if err != nil {
+		return nil, err
+	}
+	pid, err := peer.IDFromPublicKey(libp2pPub)
+	if err != nil {
 		return nil, err
 	}
 
-	return []ed25519.PublicKey{ed25519.PublicKey(remotePub)}, nil
+	return []PeerInfo{{PublicKey: remotePub, PeerID: pid}}, nil
 }
 
-func JoinPairing(id *identity.Identity, code string, addr string) (ed25519.PublicKey, error) {
+func JoinPairing(id *identity.Identity, code string, addr string) (*PeerInfo, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -77,14 +95,25 @@ func JoinPairing(id *identity.Identity, code string, addr string) (ed25519.Publi
 	}
 
 	// 2. Exchange public keys
-	remotePub := make([]byte, ed25519.PublicKeySize)
-	if _, err := io.ReadFull(conn, remotePub); err != nil {
+	remotePubBytes := make([]byte, ed25519.PublicKeySize)
+	if _, err := io.ReadFull(conn, remotePubBytes); err != nil {
 		return nil, err
 	}
+	remotePub := ed25519.PublicKey(remotePubBytes)
 
 	if _, err := conn.Write(id.PublicKey); err != nil {
 		return nil, err
 	}
 
-	return ed25519.PublicKey(remotePub), nil
+	// Derive PeerID
+	libp2pPub, err := libp2pcrypto.UnmarshalEd25519PublicKey(remotePub)
+	if err != nil {
+		return nil, err
+	}
+	pid, err := peer.IDFromPublicKey(libp2pPub)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PeerInfo{PublicKey: remotePub, PeerID: pid}, nil
 }

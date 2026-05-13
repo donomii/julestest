@@ -1,11 +1,12 @@
 package pairing
 
 import (
-	"crypto/ed25519"
 	"fmt"
 	"personal-net/pkg/identity"
 	"testing"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func TestPairing(t *testing.T) {
@@ -15,22 +16,22 @@ func TestPairing(t *testing.T) {
 	port := 9999
 
 	errCh := make(chan error, 1)
-	var remotePub2 ed25519.PublicKey
+	var remotePeer2 peer.ID
 
 	go func() {
-		pubs, err := HandlePairing(id1, code, port)
+		peers, err := HandlePairing(id1, code, port)
 		if err != nil {
 			errCh <- err
 			return
 		}
-		remotePub2 = pubs[0]
+		remotePeer2 = peers[0].PeerID
 		errCh <- nil
 	}()
 
 	// Wait for server to start
 	time.Sleep(100 * time.Millisecond)
 
-	remotePub1, err := JoinPairing(id2, code, fmt.Sprintf("localhost:%d", port))
+	pinfo, err := JoinPairing(id2, code, fmt.Sprintf("localhost:%d", port))
 	if err != nil {
 		t.Fatalf("JoinPairing failed: %v", err)
 	}
@@ -39,11 +40,18 @@ func TestPairing(t *testing.T) {
 		t.Fatalf("HandlePairing failed: %v", err)
 	}
 
-	if !id1.PublicKey.Equal(remotePub1) {
-		t.Errorf("public key mismatch for id1")
+	// Calculate expected PeerIDs
+	priv1, _ := id1.Libp2pPrivKey()
+	pid1, _ := peer.IDFromPublicKey(priv1.GetPublic())
+
+	priv2, _ := id2.Libp2pPrivKey()
+	pid2, _ := peer.IDFromPublicKey(priv2.GetPublic())
+
+	if pid1 != pinfo.PeerID {
+		t.Errorf("peer ID mismatch for id1: expected %s, got %s", pid1, pinfo.PeerID)
 	}
 
-	if !id2.PublicKey.Equal(remotePub2) {
-		t.Errorf("public key mismatch for id2")
+	if pid2 != remotePeer2 {
+		t.Errorf("peer ID mismatch for id2: expected %s, got %s", pid2, remotePeer2)
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 )
 
 type Identity struct {
@@ -27,6 +29,10 @@ func GenerateIdentity() (*Identity, error) {
 
 func (id *Identity) Fingerprint() string {
 	return hex.EncodeToString(id.PublicKey)
+}
+
+func (id *Identity) Libp2pPrivKey() (libp2pcrypto.PrivKey, error) {
+	return libp2pcrypto.UnmarshalEd25519PrivateKey(id.PrivateKey)
 }
 
 func SaveIdentity(id *Identity, path string) error {
