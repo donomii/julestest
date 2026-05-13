@@ -3,6 +3,7 @@ package pairing
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/skip2/go-qrcode"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 type PeerInfo struct {
@@ -20,7 +22,7 @@ type PeerInfo struct {
 }
 
 func GenerateLinkCode() (string, error) {
-	b := make([]byte, 4)
+	b := make([]byte, 8) // Longer code for better security
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
@@ -49,25 +51,19 @@ func HandlePairing(id *identity.Identity, code string, port int) ([]PeerInfo, er
 	}
 	defer conn.Close()
 
-	// 1. Receive code
-	receivedCode := make([]byte, len(code))
-	if _, err := io.ReadFull(conn, receivedCode); err != nil {
-		return nil, err
-	}
-	if string(receivedCode) != code {
-		return nil, fmt.Errorf("invalid link code")
-	}
+	// Derive a 32-byte key from the link code
+	key := sha256.Sum256([]byte(code))
 
-	// 2. Exchange public keys
-	if _, err := conn.Write(id.PublicKey); err != nil {
+	// Receive encrypted public key from peer
+	remotePub, err := receiveEncrypted(conn, &key)
+	if err != nil {
 		return nil, err
 	}
 
-	remotePubBytes := make([]byte, ed25519.PublicKeySize)
-	if _, err := io.ReadFull(conn, remotePubBytes); err != nil {
+	// Send our encrypted public key
+	if err := sendEncrypted(conn, &key, id.PublicKey); err != nil {
 		return nil, err
 	}
-	remotePub := ed25519.PublicKey(remotePubBytes)
 
 	// Derive PeerID
 	libp2pPub, err := libp2pcrypto.UnmarshalEd25519PublicKey(remotePub)
@@ -89,19 +85,16 @@ func JoinPairing(id *identity.Identity, code string, addr string) (*PeerInfo, er
 	}
 	defer conn.Close()
 
-	// 1. Send code
-	if _, err := conn.Write([]byte(code)); err != nil {
+	key := sha256.Sum256([]byte(code))
+
+	// Send our encrypted public key
+	if err := sendEncrypted(conn, &key, id.PublicKey); err != nil {
 		return nil, err
 	}
 
-	// 2. Exchange public keys
-	remotePubBytes := make([]byte, ed25519.PublicKeySize)
-	if _, err := io.ReadFull(conn, remotePubBytes); err != nil {
-		return nil, err
-	}
-	remotePub := ed25519.PublicKey(remotePubBytes)
-
-	if _, err := conn.Write(id.PublicKey); err != nil {
+	// Receive encrypted public key from peer
+	remotePub, err := receiveEncrypted(conn, &key)
+	if err != nil {
 		return nil, err
 	}
 
@@ -116,4 +109,33 @@ func JoinPairing(id *identity.Identity, code string, addr string) (*PeerInfo, er
 	}
 
 	return &PeerInfo{PublicKey: remotePub, PeerID: pid}, nil
+}
+
+func sendEncrypted(w io.Writer, key *[32]byte, data []byte) error {
+	var nonce [24]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+
+	out := secretbox.Seal(nonce[:], data, &nonce, key)
+	_, err := w.Write(out)
+	return err
+}
+
+func receiveEncrypted(r io.Reader, key *[32]byte) ([]byte, error) {
+	// secretbox.Overhead is 16. ed25519.PublicKeySize is 32. Nonce is 24.
+	// Total expected: 24 + 32 + 16 = 72
+	buf := make([]byte, 72)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+
+	var nonce [24]byte
+	copy(nonce[:], buf[:24])
+
+	decrypted, ok := secretbox.Open(nil, buf[24:], &nonce, key)
+	if !ok {
+		return nil, fmt.Errorf("decryption failed (likely invalid link code)")
+	}
+	return decrypted, nil
 }

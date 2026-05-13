@@ -12,6 +12,8 @@ import (
 	"personal-net/pkg/identity"
 	"personal-net/pkg/pairing"
 	"personal-net/pkg/transport"
+	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -21,8 +23,17 @@ import (
 const ProtocolID = "/pnet/1.0.0"
 
 type Config struct {
-	TrustedNodes map[string]string `json:"trusted_nodes"` // fingerprint -> peerID
+	TrustedNodes map[string]*NodeRecord `json:"trusted_nodes"` // fingerprint -> NodeRecord
 }
+
+type NodeRecord struct {
+	PeerID    string   `json:"peer_id"`
+	Addresses []string `json:"addresses"`
+}
+
+var (
+	configLock sync.Mutex
+)
 
 func main() {
 	home, _ := os.UserHomeDir()
@@ -31,8 +42,7 @@ func main() {
 	configPath := filepath.Join(configDir, "config.json")
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: pnet <command> [args]")
-		fmt.Println("Commands: init, start, pair-host, pair-join, list, ping")
+		printUsage()
 		return
 	}
 
@@ -47,8 +57,8 @@ func main() {
 		if err := identity.SaveIdentity(id, keyPath); err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("Identity initialized. Fingerprint: %s\n", id.Fingerprint())
-		saveConfig(configPath, &Config{TrustedNodes: make(map[string]string)})
+		fmt.Printf("✅ Identity initialized.\nFingerprint: %s\n", id.Fingerprint())
+		saveConfig(configPath, &Config{TrustedNodes: make(map[string]*NodeRecord)})
 
 	case "start":
 		id, conf := loadIdAndConfig(keyPath, configPath)
@@ -58,29 +68,43 @@ func main() {
 		}
 		defer h.Close()
 
-		fmt.Printf("Node started. PeerID: %s\n", h.ID().String())
-		fmt.Printf("Listening on:\n")
+		fmt.Printf("🚀 Node started.\nPeerID: %s\nFingerprint: %s\n", h.ID().String(), id.Fingerprint())
+		fmt.Printf("\nListening on:\n")
 		for _, addr := range h.Addrs() {
 			fmt.Printf("  %s/p2p/%s\n", addr, h.ID())
 		}
 
+		// Background discovery listener
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				peers := h.Network().Peers()
+				for _, p := range peers {
+					addrs := h.Peerstore().Addrs(p)
+					updatePeerAddresses(configPath, p.String(), addrs)
+				}
+			}
+		}()
+
 		h.SetStreamHandler(ProtocolID, func(s network.Stream) {
 			remotePeer := s.Conn().RemotePeer()
 			isTrusted := false
-			for _, trustedID := range conf.TrustedNodes {
-				if trustedID == remotePeer.String() {
+			configLock.Lock()
+			for _, record := range conf.TrustedNodes {
+				if record.PeerID == remotePeer.String() {
 					isTrusted = true
 					break
 				}
 			}
+			configLock.Unlock()
 
 			if !isTrusted {
-				fmt.Printf("Unrecognized peer attempted to connect: %s\n", remotePeer)
+				fmt.Printf("⚠️  Unrecognized peer attempted to connect: %s\n", remotePeer)
 				s.Reset()
 				return
 			}
 
-			fmt.Printf("Received message from: %s\n", remotePeer)
+			fmt.Printf("📩 Received message from: %s\n", remotePeer)
 			buf := make([]byte, 4)
 			if _, err := io.ReadFull(s, buf); err == nil {
 				if string(buf) == "ping" {
@@ -98,7 +122,8 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("Pairing code: %s\n", code)
+		fmt.Printf("🔑 Pairing code: %s\n", code)
+		fmt.Println("Scan the QR code below on the joining device:")
 		pairing.DisplayQRCode(code)
 
 		peers, err := pairing.HandlePairing(id, code, 9000)
@@ -107,8 +132,10 @@ func main() {
 		}
 		for _, p := range peers {
 			fp := hex.EncodeToString(p.PublicKey)
-			conf.TrustedNodes[fp] = p.PeerID.String()
-			fmt.Printf("Paired with: %s (PeerID: %s)\n", fp, p.PeerID)
+			conf.TrustedNodes[fp] = &NodeRecord{
+				PeerID: p.PeerID.String(),
+			}
+			fmt.Printf("🤝 Paired with: %s\n(PeerID: %s)\n", fp, p.PeerID)
 		}
 		saveConfig(configPath, conf)
 
@@ -125,24 +152,47 @@ func main() {
 			log.Fatal(err)
 		}
 		fp := hex.EncodeToString(p.PublicKey)
-		conf.TrustedNodes[fp] = p.PeerID.String()
-		fmt.Printf("Successfully paired with: %s (PeerID: %s)\n", fp, p.PeerID)
+		conf.TrustedNodes[fp] = &NodeRecord{
+			PeerID: p.PeerID.String(),
+		}
+		fmt.Printf("✨ Successfully paired with: %s\n(PeerID: %s)\n", fp, p.PeerID)
 		saveConfig(configPath, conf)
 
 	case "list":
 		_, conf := loadIdAndConfig(keyPath, configPath)
-		fmt.Println("Trusted nodes:")
-		for fp, pid := range conf.TrustedNodes {
-			fmt.Printf("- %s (PeerID: %s)\n", fp, pid)
+		fmt.Println("📜 Trusted nodes:")
+		if len(conf.TrustedNodes) == 0 {
+			fmt.Println("  (No trusted nodes yet. Run 'pair-host' or 'pair-join' to add some.)")
+		}
+		for fp, record := range conf.TrustedNodes {
+			fmt.Printf("- %s\n    PeerID: %s\n", fp, record.PeerID)
+			for _, addr := range record.Addresses {
+				fmt.Printf("    📍 %s\n", addr)
+			}
+		}
+
+	case "revoke":
+		_, conf := loadIdAndConfig(keyPath, configPath)
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: pnet revoke <fingerprint>")
+			return
+		}
+		fp := os.Args[2]
+		if _, ok := conf.TrustedNodes[fp]; ok {
+			delete(conf.TrustedNodes, fp)
+			saveConfig(configPath, conf)
+			fmt.Printf("🗑️  Revoked node: %s\n", fp)
+		} else {
+			fmt.Printf("❌ Node not found: %s\n", fp)
 		}
 
 	case "ping":
-		id, _ := loadIdAndConfig(keyPath, configPath)
+		id, conf := loadIdAndConfig(keyPath, configPath)
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: pnet ping <multiaddr>")
+			fmt.Println("Usage: pnet ping <fingerprint|peerID|multiaddr>")
 			return
 		}
-		targetAddr := os.Args[2]
+		target := os.Args[2]
 
 		h, err := transport.CreateHost(id, 0)
 		if err != nil {
@@ -150,16 +200,45 @@ func main() {
 		}
 		defer h.Close()
 
-		maddr, err := multiaddr.NewMultiaddr(targetAddr)
-		if err != nil {
-			log.Fatal(err)
+		var info *peer.AddrInfo
+
+		if record, ok := conf.TrustedNodes[target]; ok {
+			pid, _ := peer.Decode(record.PeerID)
+			info = &peer.AddrInfo{ID: pid}
+			for _, a := range record.Addresses {
+				m, _ := multiaddr.NewMultiaddr(a)
+				info.Addrs = append(info.Addrs, m)
+			}
+		} else {
+			pid, err := peer.Decode(target)
+			if err == nil {
+				info = &peer.AddrInfo{ID: pid}
+				for _, record := range conf.TrustedNodes {
+					if record.PeerID == target {
+						for _, a := range record.Addresses {
+							m, _ := multiaddr.NewMultiaddr(a)
+							info.Addrs = append(info.Addrs, m)
+						}
+						break
+					}
+				}
+			} else {
+				maddr, err := multiaddr.NewMultiaddr(target)
+				if err != nil {
+					log.Fatal("Invalid target. Must be fingerprint, PeerID, or Multiaddr.")
+				}
+				info, err = peer.AddrInfoFromP2pAddr(maddr)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
 		}
 
-		info, err := peer.AddrInfoFromP2pAddr(maddr)
-		if err != nil {
-			log.Fatal(err)
+		if len(info.Addrs) == 0 {
+			fmt.Printf("🔍 PeerID %s found, but no addresses known. Trying discovery...\n", info.ID)
 		}
 
+		fmt.Printf("📡 Connecting to %s...\n", info.ID)
 		if err := h.Connect(context.Background(), *info); err != nil {
 			log.Fatal(err)
 		}
@@ -173,11 +252,36 @@ func main() {
 		s.Write([]byte("ping"))
 		resp := make([]byte, 4)
 		io.ReadFull(s, resp)
-		fmt.Printf("Received: %s\n", string(resp))
+		fmt.Printf("🔔 Received: %s\n", string(resp))
+
+	case "status":
+		id, _ := loadIdAndConfig(keyPath, configPath)
+		fmt.Printf("👤 Local Fingerprint: %s\n", id.Fingerprint())
+		fmt.Println("\nStatus command requires a running node. Use 'start' to see live activity.")
+
+	case "help":
+		printUsage()
 
 	default:
-		fmt.Println("Unknown command")
+		fmt.Printf("❓ Unknown command: %s\n", cmd)
+		printUsage()
 	}
+}
+
+func printUsage() {
+	fmt.Println("pnet - Personal Area Network Manager")
+	fmt.Println("\nUsage:")
+	fmt.Println("  pnet <command> [args]")
+	fmt.Println("\nCommands:")
+	fmt.Println("  init             Initialize local device identity")
+	fmt.Println("  start            Start node and discovery")
+	fmt.Println("  pair-host        Accept a new device (displays QR code)")
+	fmt.Println("  pair-join        Join an existing network")
+	fmt.Println("  list             List trusted devices")
+	fmt.Println("  revoke <fp>      Remove a trusted device")
+	fmt.Println("  ping <target>    Test connection to a trusted device")
+	fmt.Println("  status           Show local device info")
+	fmt.Println("  help             Show this help message")
 }
 
 func loadIdAndConfig(keyPath, configPath string) (*identity.Identity, *Config) {
@@ -186,19 +290,57 @@ func loadIdAndConfig(keyPath, configPath string) (*identity.Identity, *Config) {
 		log.Fatal("Identity not initialized. Run 'pnet init' first.")
 	}
 
+	configLock.Lock()
+	defer configLock.Unlock()
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return id, &Config{TrustedNodes: make(map[string]string)}
+		return id, &Config{TrustedNodes: make(map[string]*NodeRecord)}
 	}
 	var conf Config
 	json.Unmarshal(data, &conf)
 	if conf.TrustedNodes == nil {
-		conf.TrustedNodes = make(map[string]string)
+		conf.TrustedNodes = make(map[string]*NodeRecord)
 	}
 	return id, &conf
 }
 
 func saveConfig(path string, conf *Config) {
+	configLock.Lock()
+	defer configLock.Unlock()
 	data, _ := json.MarshalIndent(conf, "", "  ")
 	os.WriteFile(path, data, 0600)
+}
+
+func updatePeerAddresses(configPath string, pid string, addrs []multiaddr.Multiaddr) {
+	configLock.Lock()
+	defer configLock.Unlock()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	var conf Config
+	json.Unmarshal(data, &conf)
+
+	updated := false
+	for _, record := range conf.TrustedNodes {
+		if record.PeerID == pid {
+			addrMap := make(map[string]bool)
+			for _, a := range record.Addresses {
+				addrMap[a] = true
+			}
+			for _, a := range addrs {
+				s := a.String()
+				if !addrMap[s] {
+					record.Addresses = append(record.Addresses, s)
+					updated = true
+				}
+			}
+			break
+		}
+	}
+
+	if updated {
+		data, _ := json.MarshalIndent(conf, "", "  ")
+		os.WriteFile(configPath, data, 0600)
+	}
 }
